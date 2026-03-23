@@ -1,341 +1,169 @@
-const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cloudinary = require('cloudinary').v2;
-const Anthropic = require('@anthropic-ai/sdk');
-const ExcelJS = require('exceljs');
-require('dotenv').config();
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { createClient } from '@supabase/supabase-js';
+import Anthropic from '@anthropic-ai/sdk';
+import multer from 'multer';
+import { v2 as cloudinary } from 'cloudinary';
+import ExcelJS from 'exceljs';
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
-// Supabase
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+// Init Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// Cloudinary
+// Init Cloudinary
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Anthropic
+// Init Anthropic
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Multer (memory storage)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+// Multer
+const storage = multer.memoryStorage();
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
-// Middleware
-app.use(cors({ origin: '*' }));
-app.use(express.json());
-
-// Auth middleware
+// JWT Middleware
 const authMiddleware = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
-  } catch {
-    res.status(401).json({ error: 'Invalid token' });
-  }
+  } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
-// ─────────────────────────────────────────
-// AUTH ROUTES
-// ─────────────────────────────────────────
-
-// POST /api/auth/register
+// Auth Routes
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password, name, company } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-
-    const { data: existing } = await supabase
-      .from('users')
-      .select('id')
-      .eq('email', email)
-      .single();
-
-    if (existing) return res.status(409).json({ error: 'Email already exists' });
-
-    const passwordHash = await bcrypt.hash(password, 12);
-    const { data: user, error } = await supabase
-      .from('users')
-      .insert({ email, password_hash: passwordHash, name: name || '', company: company || '' })
-      .select()
-      .single();
-
-    if (error) throw error;
-
-    const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, company: user.company } });
-  } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: err.message });
-  }
+    const { email, password, nom, cabinet } = req.body;
+    const password_hash = await bcrypt.hash(password, 12);
+    const { data, error } = await supabase
+      .from('users').insert({ email, password_hash, nom, cabinet }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    const token = jwt.sign({ id: data.id, email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: data.id, email, nom, cabinet } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .single();
-
-    if (error || !user) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name, company: user.company } });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
+    if (!user || !await bcrypt.compare(password, user.password_hash))
+      return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: user.id, email }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user: { id: user.id, email, nom: user.nom, cabinet: user.cabinet } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /api/auth/me
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
-  const { data: user } = await supabase.from('users').select('id,email,name,company').eq('id', req.user.userId).single();
-  res.json({ user });
-});
-
-// ─────────────────────────────────────────
-// INVOICES ROUTES
-// ─────────────────────────────────────────
-
-// GET /api/invoices
-app.get('/api/invoices', authMiddleware, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('invoices')
-      .select('*')
-      .eq('user_id', req.user.userId)
-      .order('created_at', { ascending: false });
-    if (error) throw error;
-    res.json({ invoices: data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/invoices/upload
-app.post('/api/invoices/upload', authMiddleware, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+// Upload & Process Invoice
+app.post('/api/invoices/upload', authMiddleware, upload.array('files', 10), async (req, res) => {
+  const results = [];
+  for (const file of req.files) {
+    const { data: inv } = await supabase.from('invoices')
+      .insert({ user_id: req.user.id, filename: file.originalname, status: 'processing' })
+      .select().single();
 
     // Upload to Cloudinary
-    const uploadResult = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        { folder: 'comptaai', resource_type: 'auto' },
-        (err, result) => err ? reject(err) : resolve(result)
-      );
-      stream.end(req.file.buffer);
-    });
-
-    // Save to DB
-    const { data: invoice, error } = await supabase
-      .from('invoices')
-      .insert({
-        user_id: req.user.userId,
-        filename: req.file.originalname,
-        file_url: uploadResult.secure_url,
-        cloudinary_public_id: uploadResult.public_id,
-        status: 'uploaded',
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json({ invoice });
-  } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: err.message });
+    const b64 = Buffer.from(file.buffer).toString('base64');
+    const dataUri = `data:${file.mimetype};base64,${b64}`;
+    const uploaded = await cloudinary.uploader.upload(dataUri, { folder: 'comptaai' });
+    
+    // Extract with AI
+    processInvoice(inv.id, file, uploaded.secure_url, req.user.id);
+    results.push({ id: inv.id, status: 'processing' });
   }
+  res.json({ uploaded: results.length, results });
 });
 
-// POST /api/invoices/:id/process
-app.post('/api/invoices/:id/process', authMiddleware, async (req, res) => {
+async function processInvoice(id, file, fileUrl, userId) {
   try {
-    const { id } = req.params;
-
-    const { data: invoice, error: fetchErr } = await supabase
-      .from('invoices')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', req.user.userId)
-      .single();
-
-    if (fetchErr || !invoice) return res.status(404).json({ error: 'Invoice not found' });
-
-    // Update status
-    await supabase.from('invoices').update({ status: 'processing' }).eq('id', id);
-
-    // Fetch image from Cloudinary URL
-    const imageResp = await fetch(invoice.file_url);
-    const imageBuffer = await imageResp.arrayBuffer();
-    const base64 = Buffer.from(imageBuffer).toString('base64');
-    const mediaType = imageResp.headers.get('content-type') || 'image/jpeg';
-
-    // Call Claude API
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-5',
+    const b64 = Buffer.from(file.buffer).toString('base64');
+    const msg = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
       max_tokens: 1024,
       messages: [{
         role: 'user',
         content: [{
           type: 'image',
-          source: { type: 'base64', media_type: mediaType, data: base64 },
+          source: { type: 'base64', media_type: file.mimetype, data: b64 }
         }, {
           type: 'text',
-          text: 'Extract invoice data from this image. Return JSON with these exact fields: { "supplier": "company name", "invoice_number": "invoice number", "date": "YYYY-MM-DD", "due_date": "YYYY-MM-DD or null", "subtotal": number, "tva_rate": number (7, 10, 14, or 20), "tva_amount": number, "total": number, "type": "vente" or "achat", "description": "brief description" }. Return only valid JSON, no explanation.',
-        }],
-      }],
+          text: 'Extract from this Moroccan invoice and return JSON only: { "client_nom": "", "ice": "", "if_number": "", "date": "YYYY-MM-DD", "ht": 0, "tva_rate": 20, "tva": 0, "ttc": 0, "type": "client" }'
+        }]
+      }]
     });
 
-    let extracted = {};
-    try {
-      const jsonText = message.content[0].text.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-      extracted = JSON.parse(jsonText);
-    } catch {
-      extracted = { description: message.content[0].text };
-    }
-
-    // Calculate TVA
-    const tvaRate = extracted.tva_rate || 20;
-    const total = extracted.total || 0;
-    const subtotal = extracted.subtotal || (total / (1 + tvaRate / 100));
-    const tvaAmount = extracted.tva_amount || (total - subtotal);
-
-    const { data: updated, error: updateErr } = await supabase
-      .from('invoices')
-      .update({
-        status: 'processed',
-        supplier: extracted.supplier,
-        invoice_number: extracted.invoice_number,
-        date: extracted.date,
-        due_date: extracted.due_date,
-        subtotal: subtotal,
-        tva_rate: tvaRate,
-        tva_amount: tvaAmount,
-        total: total,
-        type: extracted.type || 'achat',
-        description: extracted.description,
-        extracted_data: extracted,
-      })
-      .eq('id', id)
-      .select()
-      .single();
-
-    if (updateErr) throw updateErr;
-    res.json({ invoice: updated });
-  } catch (err) {
-    console.error('Process error:', err);
-    await supabase.from('invoices').update({ status: 'error', error_message: err.message }).eq('id', req.params.id);
-    res.status(500).json({ error: err.message });
+    const extracted = JSON.parse(msg.content[0].text.match(/\{[\s\S]*\}/)[0]);
+    await supabase.from('invoices').update({
+      ...extracted, file_url: fileUrl, status: 'completed'
+    }).eq('id', id);
+  } catch (e) {
+    await supabase.from('invoices').update({ status: 'error', error_message: e.message }).eq('id', id);
   }
+}
+
+// Get Invoices
+app.get('/api/invoices', authMiddleware, async (req, res) => {
+  const { data } = await supabase.from('invoices')
+    .select('*').eq('user_id', req.user.id).order('created_at', { ascending: false });
+  res.json(data || []);
 });
 
-// DELETE /api/invoices/:id
+// Delete Invoice
 app.delete('/api/invoices/:id', authMiddleware, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data: invoice } = await supabase.from('invoices').select('cloudinary_public_id').eq('id', id).eq('user_id', req.user.userId).single();
-    
-    if (invoice && invoice.cloudinary_public_id) {
-      await cloudinary.uploader.destroy(invoice.cloudinary_public_id, { resource_type: 'auto' });
-    }
-    
-    await supabase.from('invoices').delete().eq('id', id).eq('user_id', req.user.userId);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  await supabase.from('invoices').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+  res.json({ success: true });
 });
 
-// ─────────────────────────────────────────
-// EXPORT ROUTES
-// ─────────────────────────────────────────
+// Dashboard Stats
+app.get('/api/dashboard', authMiddleware, async (req, res) => {
+  const { data: invoices } = await supabase.from('invoices')
+    .select('*').eq('user_id', req.user.id).eq('status', 'completed');
+  const stats = {
+    total: invoices?.length || 0,
+    tva_collectee: invoices?.filter(i => i.type === 'client').reduce((s, i) => s + Number(i.tva || 0), 0) || 0,
+    tva_deductible: invoices?.filter(i => i.type === 'fournisseur').reduce((s, i) => s + Number(i.tva || 0), 0) || 0,
+  };
+  stats.tva_nette = stats.tva_collectee - stats.tva_deductible;
+  res.json(stats);
+});
 
-// GET /api/export/csv
+// Export CSV
 app.get('/api/export/csv', authMiddleware, async (req, res) => {
-  try {
-    const { data: invoices } = await supabase
-      .from('invoices')
-      .select('*')
-      .eq('user_id', req.user.userId)
-      .eq('status', 'processed')
-      .order('date');
-
-    const bom = '﻿';
-    const headers = 'Date;Fournisseur;N Facture;HT;TVA%;TVA MAD;TTC;Type;Description
-';
-    const rows = (invoices || []).map(inv =>
-      inv.date + ';' + (inv.supplier || '') + ';' + (inv.invoice_number || '') + ';' + (inv.subtotal || 0).toFixed(2) + ';' + (inv.tva_rate || 0) + '%;' + (inv.tva_amount || 0).toFixed(2) + ';' + (inv.total || 0).toFixed(2) + ';' + (inv.type || '') + ';' + (inv.description || '')
-    ).join('
-');
-
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="ComptaAI_Export.csv"');
-    res.send(bom + headers + rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const { data } = await supabase.from('invoices').select('*').eq('user_id', req.user.id).eq('status', 'completed');
+  const rows = [['Client/Fournisseur','ICE','IF','Date','HT','TVA%','TVA','TTC','Type']];
+  data?.forEach(i => rows.push([i.client_nom,i.ice,i.if_number,i.date,i.ht,i.tva_rate,i.tva,i.ttc,i.type]));
+  const csv = rows.map(r => r.join(',')).join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename=comptaai_export.csv');
+  res.send('\uFEFF' + csv);
 });
 
-// GET /api/export/excel
+// Export Excel
 app.get('/api/export/excel', authMiddleware, async (req, res) => {
-  try {
-    const { data: invoices } = await supabase
-      .from('invoices')
-      .select('*')
-      .eq('user_id', req.user.userId)
-      .eq('status', 'processed')
-      .order('date');
-
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'ComptaAI';
-
-    const ws = wb.addWorksheet('Factures');
-    ws.addRow(['Date', 'Fournisseur', 'N Facture', 'HT (MAD)', 'TVA %', 'TVA (MAD)', 'TTC (MAD)', 'Type', 'Description']);
-    ws.getRow(1).font = { bold: true };
-    
-    (invoices || []).forEach(inv => {
-      ws.addRow([inv.date, inv.supplier, inv.invoice_number, inv.subtotal, inv.tva_rate ? inv.tva_rate + '%' : '', inv.tva_amount, inv.total, inv.type, inv.description]);
-    });
-
-    const wsTva = wb.addWorksheet('Resume TVA');
-    wsTva.addRow(['RESUME TVA - ComptaAI']);
-    wsTva.addRow([]);
-    
-    let collectee = 0, deductible = 0;
-    (invoices || []).forEach(inv => {
-      if (inv.type === 'vente') collectee += (inv.tva_amount || 0);
-      else deductible += (inv.tva_amount || 0);
-    });
-    wsTva.addRow(['TVA Collectee (Ventes)', collectee]);
-    wsTva.addRow(['TVA Deductible (Achats)', deductible]);
-    wsTva.addRow(['TVA NETTE', collectee - deductible]);
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="ComptaAI_NT_COMPTA.xlsx"');
-    await wb.xlsx.write(res);
-    res.end();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const { data } = await supabase.from('invoices').select('*').eq('user_id', req.user.id).eq('status', 'completed');
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Factures');
+  ws.addRow(['Client/Fournisseur','ICE','IF','Date','HT (MAD)','TVA %','TVA (MAD)','TTC (MAD)','Type']);
+  data?.forEach(i => ws.addRow([i.client_nom,i.ice,i.if_number,i.date,i.ht,i.tva_rate,i.tva,i.ttc,i.type]));
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename=comptaai_export.xlsx');
+  await wb.xlsx.write(res);
+  res.end();
 });
 
-// START
-app.listen(PORT, () => console.log('ComptaAI API running on port ' + PORT));
-module.exports = app;
+app.get('/health', (_, res) => res.json({ status: 'ok', service: 'ComptaAI' }));
+app.listen(PORT, () => console.log(`ComptaAI backend running on port ${PORT}`));
