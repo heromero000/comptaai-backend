@@ -72,13 +72,13 @@ app.post('/api/auth/register', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 12);
     const { data: user, error } = await supabase
       .from('users')
-      .insert({ email, password_hash: passwordHash, name: name || '' })
+      .insert({ email, password_hash: passwordHash, nom: name || '' })
       .select().single();
 
     if (error) throw error;
 
     const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.nom } });
   } catch (err) {
     console.error('Register error:', err);
     res.status(500).json({ error: err.message });
@@ -98,7 +98,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user.id, email: user.email, name: user.name } });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.nom } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -106,7 +106,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 // GET /api/auth/me
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
-  const { data: user } = await supabase.from('users').select('id,email,name').eq('id', req.user.userId).single();
+  const { data: user } = await supabase.from('users').select('id,email,nom').eq('id', req.user.userId).single();
   res.json({ user });
 });
 
